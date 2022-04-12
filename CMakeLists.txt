@@ -1,11 +1,16 @@
 cmake_minimum_required(VERSION 3.11)
 
-project(countd)
-set(CMAKE_CXX_STANDARD 20)
-
+include(klsxx/Build/Config.cmake)
+project(Count)
 set(KLS_DISABLE_TEST TRUE)
+
+kls_configure()
 add_subdirectory(klsxx)
 
-file(GLOB_RECURSE SRC ${CMAKE_CURRENT_SOURCE_DIR}/Source/*.*)
-add_executable(countd ${SRC})
-target_link_libraries(countd PUBLIC klsxx::essential klsxx::coroutine klsxx::thread klsxx::io)
+add_executable(countd)
+kls_target(countd)
+kls_module_source_directory(countd Source)
+kls_vcpkg_package(nlohmann-json)
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(countd PRIVATE nlohmann_json nlohmann_json::nlohmann_json)
+target_link_libraries(countd PUBLIC klsxx::essential klsxx::coroutine klsxx::thread klsxx::io klsxx::phttp)

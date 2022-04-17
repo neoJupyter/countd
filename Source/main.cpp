@@ -19,7 +19,12 @@ namespace count {
             return std::forward<T>(item);
         }
 
-        ValueAsync<> close() { for (auto &f: m_finals) co_await f(); }
+        ValueAsync<> close() {
+            while (!m_finals.empty()) {
+                co_await m_finals.back()();
+                m_finals.pop_back();
+            }
+        }
     private:
         std::vector<std::function<ValueAsync<>()>> m_finals{};
     };
@@ -65,20 +70,21 @@ namespace count {
         co_await storage.store(std::move(map));
     }
 
-    std::unique_ptr<Journal> create_journal(const json &cfg) {
-        return std::make_unique<Journal>(cfg["path"]);
+    std::unique_ptr<Journal> create_journal(Cache &cache, const json &cfg) {
+        return std::make_unique<Journal>(cache, cfg["path"]);
     }
 
     ValueAsync<> start_service(const char *arg) {
         AsyncRAII raii{};
         co_await uses(raii, [arg](AsyncRAII &raii) -> ValueAsync<> {
+            Cache cache{};
             auto cfg = co_await read_config(arg);
             auto server = raii.add(create_server(cfg["server"]));
             auto storage = raii.add(co_await create_storage(cfg["storage"]));
             co_await recover_journal(cfg["journal"], *storage);
-            auto journal = raii.add(create_journal(cfg["journal"]));
+            auto journal = raii.add(create_journal(cache, cfg["journal"]));
             cfg.clear();
-            co_await run_service(*server, *storage, *journal);
+            co_await run_service(*server, *storage, *journal, cache);
         });
     }
 }

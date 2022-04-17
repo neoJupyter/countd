@@ -5,7 +5,7 @@
 
 using namespace kls::coroutine;
 
-namespace count {
+namespace njp::count {
     class AsyncRAII {
     public:
         template<class T>
@@ -13,7 +13,7 @@ namespace count {
             { item.get() };
         }
         std::decay_t<T> add(T &&item) {
-            m_finals.push_back([ptr = item.get()]() -> ValueAsync<> {
+            m_finals.push_back([ptr = item]() -> ValueAsync<> {
                 try { co_await ptr->close(); } catch (...) {}
             });
             return std::forward<T>(item);
@@ -53,8 +53,8 @@ namespace count {
             return io::Peer{io::Address::CreateIPv4(address).value(), port};
     }
 
-    std::unique_ptr<Server> create_server(const json &cfg) {
-        return std::make_unique<Server>(make_peer(cfg["address"], cfg["port"]), cfg["backlog"]);
+    std::shared_ptr<IServer> create_server(const json &cfg) {
+        return IServer::create(make_peer(cfg["address"], cfg["port"]), cfg["backlog"]);
     }
 
     ValueAsync<std::shared_ptr<IStorage>> create_storage(const json &cfg) {
@@ -66,25 +66,23 @@ namespace count {
 
     ValueAsync<> recover_journal(const json &cfg, IStorage &storage) {
         temp::unordered_map<std::string_view, int64_t> map{};
-        for (auto&&[k, v]: co_await Journal::replay(cfg["path"])) map[k] = v;
+        for (auto&&[k, v]: co_await IJournal::replay(cfg["path"])) map[k] = v;
         co_await storage.store(std::move(map));
     }
 
-    std::unique_ptr<Journal> create_journal(Cache &cache, const json &cfg) {
-        return std::make_unique<Journal>(cache, cfg["path"]);
-    }
+    auto create_journal(const json &cfg) { return IJournal::create(cfg["path"]); }
 
     ValueAsync<> start_service(const char *arg) {
         AsyncRAII raii{};
         co_await uses(raii, [arg](AsyncRAII &raii) -> ValueAsync<> {
-            Cache cache{};
             auto cfg = co_await read_config(arg);
             auto server = raii.add(create_server(cfg["server"]));
             auto storage = raii.add(co_await create_storage(cfg["storage"]));
             co_await recover_journal(cfg["journal"], *storage);
-            auto journal = raii.add(create_journal(cache, cfg["journal"]));
+            auto journal = raii.add(create_journal(cfg["journal"]));
+            auto cache = raii.add(ICache::create(storage, journal));
             cfg.clear();
-            co_await run_service(*server, *storage, *journal, cache);
+            co_await run_service(*server, *cache);
         });
     }
 }
@@ -96,7 +94,7 @@ int main(int argc, char **argv) {
         return -1;
     }
     return run_blocking([path = argv[1]]() -> ValueAsync<int> {
-        try { co_return (co_await count::start_service(path), 0); }
+        try { co_return (co_await njp::count::start_service(path), 0); }
         catch (std::exception &e) { co_return (std::cerr << e.what() << std::endl, -1); }
         catch (...) { co_return -1; }
     });

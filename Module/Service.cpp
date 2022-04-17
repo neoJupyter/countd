@@ -1,59 +1,41 @@
-#include "Enums.h"
 #include "Service.h"
 #include <variant>
-#include <kls/coroutine/Timed.h>
 
-using namespace count;
+using namespace njp;
+using namespace kls;
+using namespace njp::count;
 using namespace kls::coroutine;
 
-class BatchSubmit {
-    using Clock = std::chrono::steady_clock;
-    using Batch = kls::temp::map<kls::temp::string, int64_t>;
-public:
-    BatchSubmit(IStorage &storage, Journal &journal, Cache &cache) :
-            m_cache(cache), m_journal(journal), m_storage(storage), m_worker_future{consume()} {}
-
-    ValueAsync<> close() {
-        m_should_stop = true;
-        co_await std::move(m_worker_future);
+namespace {
+    enum Op { // 3bit
+        OP_GET = 0u,
+        OP_SET = 1u,
+        OP_INC = 3u,
+        OP_DEC = 4u,
+        OP_ADD = 5u,
+        OP_SUB = 6u
     };
-private:
-    Cache &m_cache;
-    Journal &m_journal;
-    IStorage &m_storage;
-    std::mutex m_mutex{};
-    bool m_should_stop{false};
-    ValueAsync<> m_worker_future;
 
-    ValueAsync<bool> store(Batch &batch) {
-        try {
-            temp::unordered_map<std::string_view, int64_t> map{};
-            for (auto &&[k, v]: batch) map[k] = v;
-            co_await m_storage.store(std::move(map));
-        }
-        catch (...) { co_return false; }
-        co_return true;
-    }
+    enum Cmp { // 3bit
+        CMP_NONE = 0u,
+        CMP_EQ = 1u,
+        CMP_NEQ = 2u,
+        CMP_L = 3U,
+        CMP_G = 4U,
+        CMP_LE = 5U,
+        CMP_GE = 6U
+    };
 
-    ValueAsync<> consume() {
-        std::deque<Batch> stacked{};
-        std::unique_lock lock{m_mutex};
-        do {
-            auto time_point = Clock::now() + std::chrono::seconds(5);
-            auto batch = m_cache.rotate();
-            if (!batch.empty()) {
-                co_await m_journal.rotate();
-                stacked.push_back(std::move(batch));
-                while (!stacked.empty()) {
-                    if (!co_await store(stacked.front())) break;
-                    stacked.pop_front();
-                    co_await m_journal.confirm();
-                }
-            }
-            co_await delay_until(time_point);
-        } while (!m_should_stop);
-    }
-};
+    enum Val { // 3bit
+        VAL_ZERO = 0u,
+        VAL_NAME = 1u,
+        VAL_IMMSS = 2u,
+        VAL_IMMUS = 3u,
+        VAL_IMMSI = 4u,
+        VAL_IMMUI = 5u,
+        VAL_IMMSL = 6u,
+    };
+}
 
 struct Immediate {
     int64_t value;
@@ -63,7 +45,7 @@ struct Immediate {
 
 struct StorageItem {
     int32_t key;
-    Cache &cache;
+    ICache &cache;
     void set(int64_t value) { cache.store(key, value); }
     [[nodiscard]] int64_t get() const { return cache.load(key); }
 };
@@ -71,7 +53,7 @@ struct StorageItem {
 class Value {
 public:
     explicit Value(int64_t value) : m_variant{Immediate{.value = value}} {}
-    Value(int32_t key, Cache &cache) : m_variant{StorageItem{.key = key, .cache=cache}} {}
+    Value(int32_t key, ICache &cache) : m_variant{StorageItem{.key = key, .cache=cache}} {}
 
     void set(int64_t value) {
         switch (m_variant.index()) {
@@ -133,14 +115,8 @@ public:
         for (auto &ins: m_ins) m_result.push_back(ins.run());
     }
 
-    ValueAsync<> fetch(Cache &cache) {
-
-    }
-
-    ValueAsync<> store(Journal &journal) {
-        // value is already in the cache, just flush to the journal, and we are done
-    }
-
+    ValueAsync<> fetch(ICache &cache) { co_await cache.ensure(m_id); }
+    ValueAsync<> store(ICache &cache) { co_await cache.commit(m_id); }
     temp::vector<int64_t> get() &&{ return {std::move(m_result)}; }
 private:
     temp::vector<int32_t> m_id;
@@ -148,7 +124,7 @@ private:
     temp::vector<Instruction> m_ins;
 };
 
-static Program compile(const temp::vector<uint16_t> &code, const temp::vector<int32_t> &id, Cache &cache) {
+static Program compile(const temp::vector<uint16_t> &code, const temp::vector<int32_t> &id, ICache &cache) {
     class CodeAccess {
     public:
         explicit CodeAccess(const temp::vector<uint16_t> &mData) noexcept: m_data(mData) {}
@@ -185,6 +161,7 @@ static Program compile(const temp::vector<uint16_t> &code, const temp::vector<in
                 return Value(static_cast<int64_t>((a << 48) | (b << 32) | (c << 16) | d));
             }
         }
+        throw std::runtime_error("Invalid Encoding: bad value type");
     };
     auto decodeTgt = [&](Val v) {
         if (v != Val::VAL_NAME) throw std::runtime_error("Invalid Encoding: target is not named");
@@ -203,14 +180,14 @@ static Program compile(const temp::vector<uint16_t> &code, const temp::vector<in
 }
 
 // this is the shell function for processing
-static ValueAsync<temp_json> process(const temp_json &request, Journal &journal, Cache &cache) {
+static ValueAsync<temp_json> process(const temp_json &request, ICache &cache) {
     auto id_vector = cache.acquires(request["s"]);
     auto program = compile(request["c"], id_vector, cache);
-    co_await program.fetch(cache), program.run(), co_await program.store(journal);
+    co_await program.fetch(cache), program.run(), co_await program.store(cache);
     co_return std::move(program).get();
 }
 
-ValueAsync<> count::run_service(Server &server, IStorage &storage, Journal &journal, Cache &cache) {
-    server.handles("POST", "/", [&](const temp_json &request) { return process(request, journal, cache); });
+ValueAsync<> count::run_service(IServer &server, ICache &cache) {
+    server.handles("POST", "/", [&](const temp_json &request) { return process(request, cache); });
     co_await server.run();
 }

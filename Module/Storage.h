@@ -6,7 +6,7 @@
 #include <kls/temp/STL.h>
 #include <kls/coroutine/Async.h>
 
-namespace count {
+namespace njp::count {
     using namespace kls;
 
     struct IStorage {
